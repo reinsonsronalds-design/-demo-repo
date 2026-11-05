@@ -1,2 +1,2 @@
-My first GitHub project.
+This is the main branch version.
 Working on my feature branch.
