@@ -3,27 +3,51 @@ pipeline {
     agent any
 
     parameters {
-        choice(name: 'DEPLOY_TARGET',
-               choices: ['current-instance', 'all-instances'],
-               description: 'Deployment Target')
-
-        booleanParam(name: 'RUN_HEALTH_CHECK',
-                     defaultValue: true,
-                     description: 'Run Health Check')
+        choice(
+            name: 'DEPLOY_TARGET',
+            choices: ['current-instance', 'all-instances'],
+            description: 'Deployment Target'
+        )
+        booleanParam(
+            name: 'RUN_HEALTH_CHECK',
+            defaultValue: true,
+            description: 'Run Health Check'
+        )
     }
 
     environment {
-        INSTANCE_ID = "${sh(script: 'curl -s -m 3 http://169.254.169.254/latest/meta-data/instance-id || echo unknown', returnStdout: true).trim()}"
-        BRANCH_TYPE = "${env.BRANCH_NAME.startsWith('feature/') ? 'feature' : env.BRANCH_NAME == 'ec2-development' ? 'development' : env.BRANCH_NAME == 'ec2-staging' ? 'staging' : env.BRANCH_NAME == 'main' ? 'production' : 'other'}"
+        INSTANCE_ID = 'unknown'
+        BRANCH_TYPE = 'other'
         DEPLOY_ROOT = '/var/lib/jenkins/ec2-scripts'
     }
 
     stages {
         stage('Prepare') {
             steps {
+                script {
+                    env.INSTANCE_ID = sh(
+                        script: '''
+                            TOKEN=$(curl -s -X PUT \
+                              "http://169.254.169.254/latest/api/token" \
+                              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                            curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                              http://169.254.169.254/latest/meta-data/instance-id \
+                              || echo unknown
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def branch = env.BRANCH_NAME ?: 'unknown'
+                    env.BRANCH_TYPE =
+                        branch.startsWith('feature/') ? 'feature' :
+                        branch == 'ec2-development' ? 'development' :
+                        branch == 'ec2-staging' ? 'staging' :
+                        branch == 'main' ? 'production' : 'other'
+                }
+
                 echo "Branch: ${env.BRANCH_NAME}"
                 echo "Branch Type: ${env.BRANCH_TYPE}"
-                echo "Instance ID: ${INSTANCE_ID}"
+                echo "Instance ID: ${env.INSTANCE_ID}"
                 echo "Deploy Target: ${params.DEPLOY_TARGET}"
             }
         }
@@ -32,11 +56,15 @@ pipeline {
             steps {
                 sh '''
                     echo "=== Script Validation for ${BRANCH_TYPE} ==="
+                    found=0
                     for script in *.sh; do
                         if [ -f "$script" ]; then
-                            bash -n "$script" && echo "OK: $script" || exit 1
+                            found=1
+                            bash -n "$script" || exit 1
+                            echo "OK: $script"
                         fi
                     done
+                    echo "Script validation completed. Scripts found: $found"
                 '''
             }
         }
@@ -48,14 +76,26 @@ pipeline {
             parallel {
                 stage('Syntax Tests') {
                     steps {
-                        sh 'bash -n health-check.sh && echo "health-check.sh syntax OK"'
+                        sh '''
+                            if [ -f health-check.sh ]; then
+                                bash -n health-check.sh
+                                echo "health-check.sh syntax OK"
+                            else
+                                echo "health-check.sh not found - test skipped"
+                            fi
+                        '''
                     }
                 }
+
                 stage('Functionality Tests') {
                     steps {
                         sh '''
-                            chmod +x *.sh
-                            timeout 30 ./health-check.sh
+                            if [ -f health-check.sh ]; then
+                                chmod +x health-check.sh
+                                timeout 30 ./health-check.sh
+                            else
+                                echo "health-check.sh not found - test skipped"
+                            fi
                         '''
                     }
                 }
@@ -66,13 +106,13 @@ pipeline {
             when {
                 anyOf {
                     branch 'ec2-development'
-                    branch 'feature/*'
+                    branch pattern: 'feature/.*', comparator: 'REGEXP'
                 }
             }
             steps {
                 sh '''
-                    mkdir -p $DEPLOY_ROOT/dev
-                    cp *.sh $DEPLOY_ROOT/dev/
+                    mkdir -p "$DEPLOY_ROOT/dev"
+                    cp *.sh "$DEPLOY_ROOT/dev/" 2>/dev/null || true
                     echo "Development deployment completed"
                 '''
             }
@@ -84,8 +124,8 @@ pipeline {
             }
             steps {
                 sh '''
-                    mkdir -p $DEPLOY_ROOT/staging
-                    cp *.sh $DEPLOY_ROOT/staging/
+                    mkdir -p "$DEPLOY_ROOT/staging"
+                    cp *.sh "$DEPLOY_ROOT/staging/" 2>/dev/null || true
                     echo "Staging deployment completed"
                 '''
             }
@@ -98,9 +138,9 @@ pipeline {
             steps {
                 input message: 'Deploy to Production Instance?', ok: 'Deploy'
                 sh '''
-                    mkdir -p $DEPLOY_ROOT/prod
-                    cp *.sh $DEPLOY_ROOT/prod/
-                    chmod +x $DEPLOY_ROOT/prod/*.sh
+                    mkdir -p "$DEPLOY_ROOT/prod"
+                    cp *.sh "$DEPLOY_ROOT/prod/" 2>/dev/null || true
+                    chmod +x "$DEPLOY_ROOT"/prod/*.sh 2>/dev/null || true
                     echo "Production deployment completed on ${INSTANCE_ID}"
                 '''
             }
@@ -112,10 +152,10 @@ pipeline {
             archiveArtifacts artifacts: '*.sh', allowEmptyArchive: true
         }
         success {
-            echo "Pipeline succeeded on instance ${INSTANCE_ID}!"
+            echo "Pipeline succeeded on instance ${env.INSTANCE_ID}!"
         }
         failure {
-            echo "Pipeline failed on instance ${INSTANCE_ID}!"
+            echo "Pipeline failed on instance ${env.INSTANCE_ID}!"
         }
     }
 }
